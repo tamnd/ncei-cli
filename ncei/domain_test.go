@@ -2,13 +2,10 @@ package ncei
 
 import (
 	"testing"
-
-	"github.com/tamnd/any-cli/kit"
 )
 
-// These tests are offline: they exercise the URI driver's pure string functions
-// and the host wiring (mint, body, resolve), which need no network. The client's
-// HTTP behaviour is covered in ncei_test.go.
+// These tests are offline: they exercise the URI driver's pure string functions.
+// The client's HTTP behaviour is covered in ncei_test.go.
 
 func TestDomainInfo(t *testing.T) {
 	info := Domain{}.Info()
@@ -24,53 +21,85 @@ func TestDomainInfo(t *testing.T) {
 }
 
 func TestClassify(t *testing.T) {
-	cases := []struct{ in, typ, id string }{
-		{"wiki/Go", "page", "wiki/Go"},
-		{"/about/", "page", "about"},
-		{"https://" + Host + "/team/contact", "page", "team/contact"},
+	cases := []struct {
+		in  string
+		typ string
+		id  string
+	}{
+		{"USW00094728", "station", "USW00094728"},
+		{"USW00094846", "station", "USW00094846"},
+		{"monthly", "query", "monthly"},
+		{"daily", "query", "daily"},
+		{"stations", "query", "stations"},
 	}
 	for _, tc := range cases {
 		typ, id, err := Domain{}.Classify(tc.in)
-		if err != nil || typ != tc.typ || id != tc.id {
-			t.Errorf("Classify(%q) = (%q, %q, %v), want (%q, %q, nil)",
-				tc.in, typ, id, err, tc.typ, tc.id)
+		if err != nil {
+			t.Errorf("Classify(%q) error: %v", tc.in, err)
+			continue
+		}
+		if typ != tc.typ || id != tc.id {
+			t.Errorf("Classify(%q) = (%q, %q), want (%q, %q)",
+				tc.in, typ, id, tc.typ, tc.id)
 		}
 	}
 }
 
 func TestLocate(t *testing.T) {
-	got, err := Domain{}.Locate("page", "wiki/Go")
-	want := "https://" + Host + "/wiki/Go"
+	got, err := Domain{}.Locate("station", "USW00094728")
+	want := "https://www.ncei.noaa.gov/cdo-web/datasets/GHCND/stations/GHCND:USW00094728/detail"
 	if err != nil || got != want {
 		t.Errorf("Locate = (%q, %v), want (%q, nil)", got, err, want)
 	}
+
+	_, err = Domain{}.Locate("unknown", "foo")
+	if err == nil {
+		t.Error("Locate(unknown) should return error")
+	}
 }
 
-// TestHostWiring mounts the driver in a kit Host (the runtime ant drives) and
-// checks the round trip: a record mints to its URI, its body is readable, and a
-// bare id resolves back to the same URI. The init in domain.go registers the
-// domain, so kit.Open finds it.
-func TestHostWiring(t *testing.T) {
-	h, err := kit.Open()
-	if err != nil {
-		t.Fatal(err)
+func TestLooksLikeStation(t *testing.T) {
+	cases := []struct {
+		in   string
+		want bool
+	}{
+		{"USW00094728", true},
+		{"USW00094846", true},
+		{"USW00013880", true},
+		{"monthly", false},
+		{"daily", false},
+		{"", false},
+		{"US", false},
+	}
+	for _, tc := range cases {
+		got := looksLikeStation(tc.in)
+		if got != tc.want {
+			t.Errorf("looksLikeStation(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestResolveDefaults(t *testing.T) {
+	station, start, end := resolveDefaults("", "", "")
+	if station != "USW00094728" {
+		t.Errorf("default station = %q, want USW00094728", station)
+	}
+	if start == "" {
+		t.Error("default start is empty")
+	}
+	if end == "" {
+		t.Error("default end is empty")
 	}
 
-	p := &Page{ID: "wiki/Go", URL: "https://" + Host + "/wiki/Go", Title: "Go", Body: "Go is a language."}
-	u, err := h.Mint(p)
-	if err != nil {
-		t.Fatalf("Mint: %v", err)
+	// Explicit values pass through unchanged.
+	s2, st2, en2 := resolveDefaults("USW00094846", "2024-01-01", "2024-12-31")
+	if s2 != "USW00094846" {
+		t.Errorf("station = %q, want USW00094846", s2)
 	}
-	if want := "ncei://page/wiki/Go"; u.String() != want {
-		t.Errorf("Mint = %q, want %q", u.String(), want)
+	if st2 != "2024-01-01" {
+		t.Errorf("start = %q, want 2024-01-01", st2)
 	}
-
-	if body, ok := h.Body(p); !ok || body == "" {
-		t.Errorf("Body = (%q, %v), want non-empty", body, ok)
-	}
-
-	got, err := h.ResolveOn("ncei", "about")
-	if err != nil || got.String() != "ncei://page/about" {
-		t.Errorf("ResolveOn = (%q, %v), want ncei://page/about", got.String(), err)
+	if en2 != "2024-12-31" {
+		t.Errorf("end = %q, want 2024-12-31", en2)
 	}
 }
