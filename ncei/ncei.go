@@ -1,35 +1,34 @@
 // Package ncei is the library behind the ncei command line:
-// the HTTP client, request shaping, and the typed data models for ncei.
+// the HTTP client, request shaping, and the typed data models for NOAA NCEI
+// (National Centers for Environmental Information) historical climate data.
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package ncei
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to ncei. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to NCEI.
 const DefaultUserAgent = "ncei/dev (+https://github.com/tamnd/ncei-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at ncei.com; change it once you
-// know the real endpoints you want to read.
-const Host = "ncei.com"
+// Host is the NCEI hostname.
+const Host = "www.ncei.noaa.gov"
 
-// BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+// BaseURL is the root every data request is built from.
+const BaseURL = "https://www.ncei.noaa.gov/access/services/data/v1"
 
-// Client talks to ncei over HTTP.
+// Client talks to NCEI over HTTP.
 type Client struct {
 	HTTP      *http.Client
 	UserAgent string
@@ -40,15 +39,158 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
-		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+// Config holds the tunable client settings returned by DefaultConfig.
+type Config struct {
+	Rate    time.Duration
+	Retries int
+	Timeout time.Duration
+}
+
+// DefaultConfig returns conservative defaults suitable for a public API.
+func DefaultConfig() Config {
+	return Config{
+		Rate:    500 * time.Millisecond,
+		Retries: 3,
+		Timeout: 30 * time.Second,
 	}
+}
+
+// NewClient returns a Client with sensible defaults: a 30s timeout, a 500ms
+// minimum gap between requests, and three retries on transient errors.
+func NewClient() *Client {
+	cfg := DefaultConfig()
+	return &Client{
+		HTTP:      &http.Client{Timeout: cfg.Timeout},
+		UserAgent: DefaultUserAgent,
+		Rate:      cfg.Rate,
+		Retries:   cfg.Retries,
+	}
+}
+
+// MonthlyRecord holds a single monthly climate summary for a station.
+type MonthlyRecord struct {
+	Station       string  `json:"station" kit:"id"`
+	Date          string  `json:"date"`
+	TempAvg       float64 `json:"temp_avg_c"`
+	Precipitation float64 `json:"precipitation_mm"`
+	Snow          float64 `json:"snow_mm"`
+	WindSpeed     float64 `json:"wind_speed_ms"`
+}
+
+// DailyRecord holds a single daily climate summary for a station.
+type DailyRecord struct {
+	Station       string  `json:"station" kit:"id"`
+	Date          string  `json:"date"`
+	TempMax       float64 `json:"temp_max_c"`
+	TempMin       float64 `json:"temp_min_c"`
+	TempAvg       float64 `json:"temp_avg_c"`
+	Precipitation float64 `json:"precipitation_mm"`
+	Snow          float64 `json:"snow_mm"`
+}
+
+// KnownStation is an entry in the built-in station lookup table.
+type KnownStation struct {
+	ID       string `json:"id" kit:"id"`
+	Name     string `json:"name"`
+	Location string `json:"location"`
+}
+
+// wireRecord is the flat JSON map the NCEI API returns for each row.
+type wireRecord map[string]string
+
+// KnownStations is the built-in lookup table of well-known NCEI station IDs.
+var KnownStations = []KnownStation{
+	{ID: "USW00094728", Name: "Central Park", Location: "New York, NY"},
+	{ID: "USW00094846", Name: "JFK Airport", Location: "New York, NY"},
+	{ID: "USW00013880", Name: "Hartsfield-Jackson Atlanta International Airport", Location: "Atlanta, GA"},
+	{ID: "USW00023234", Name: "Los Angeles International Airport", Location: "Los Angeles, CA"},
+	{ID: "USW00094741", Name: "O'Hare International Airport", Location: "Chicago, IL"},
+	{ID: "USW00023174", Name: "Seattle-Tacoma International Airport", Location: "Seattle, WA"},
+}
+
+// GetMonthly fetches monthly climate summaries for the given station and date range.
+// The limit parameter caps results; 0 means no cap.
+func (c *Client) GetMonthly(ctx context.Context, station, start, end string, limit int) ([]MonthlyRecord, error) {
+	params := url.Values{}
+	params.Set("dataset", "global-summary-of-the-month")
+	params.Set("stations", station)
+	params.Set("startDate", start)
+	params.Set("endDate", end)
+	params.Set("dataTypes", "TAVG,PRCP,SNOW,AWND")
+	params.Set("format", "json")
+
+	raw, err := c.Get(ctx, BaseURL+"?"+params.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var wires []wireRecord
+	if err := json.Unmarshal(raw, &wires); err != nil {
+		return nil, fmt.Errorf("parse monthly response: %w", err)
+	}
+
+	var out []MonthlyRecord
+	for _, w := range wires {
+		// Monthly dataset (global-summary-of-the-month) returns values already
+		// in standard units: temperature in °C, precipitation in mm, snow in mm,
+		// wind speed in m/s. No unit conversion needed.
+		r := MonthlyRecord{
+			Station:       w["STATION"],
+			Date:          w["DATE"],
+			TempAvg:       parseNum(w["TAVG"]),
+			Precipitation: parseNum(w["PRCP"]),
+			Snow:          parseNum(w["SNOW"]),
+			WindSpeed:     parseNum(w["AWND"]),
+		}
+		out = append(out, r)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+// GetDaily fetches daily climate summaries for the given station and date range.
+// The limit parameter caps results; 0 means no cap.
+func (c *Client) GetDaily(ctx context.Context, station, start, end string, limit int) ([]DailyRecord, error) {
+	params := url.Values{}
+	params.Set("dataset", "daily-summaries")
+	params.Set("stations", station)
+	params.Set("startDate", start)
+	params.Set("endDate", end)
+	params.Set("dataTypes", "TMAX,TMIN,TAVG,PRCP,SNOW")
+	params.Set("format", "json")
+
+	raw, err := c.Get(ctx, BaseURL+"?"+params.Encode())
+	if err != nil {
+		return nil, err
+	}
+
+	var wires []wireRecord
+	if err := json.Unmarshal(raw, &wires); err != nil {
+		return nil, fmt.Errorf("parse daily response: %w", err)
+	}
+
+	var out []DailyRecord
+	for _, w := range wires {
+		// Daily summaries return values in tenths of standard units:
+		// temperature in tenths of °C, precipitation in tenths of mm,
+		// snow in mm (not tenths). Divide temp and precip by 10.
+		r := DailyRecord{
+			Station:       w["STATION"],
+			Date:          w["DATE"],
+			TempMax:       parseNum(w["TMAX"]) / 10,
+			TempMin:       parseNum(w["TMIN"]) / 10,
+			TempAvg:       parseNum(w["TAVG"]) / 10,
+			Precipitation: parseNum(w["PRCP"]) / 10,
+			Snow:          parseNum(w["SNOW"]),
+		}
+		out = append(out, r)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // Get fetches url and returns the response body. It paces and retries according
@@ -123,78 +265,13 @@ func backoff(attempt int) time.Duration {
 	return d
 }
 
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on ncei.com. It is a stand-in for the typed records you
-// will model from the real ncei endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `ncei cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
+// parseNum parses a string as float64, returning 0 on error.
+// NCEI returns numeric values as strings in the JSON response.
+func parseNum(s string) float64 {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return 0
 	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
+	v, _ := strconv.ParseFloat(s, 64)
+	return v
 }
