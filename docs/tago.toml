@@ -1,0 +1,10 @@
+title       = "ncei"
+baseURL     = "https://ncei-cli.tamnd.com/"
+description = "A command line for ncei."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/ncei-cli"
